@@ -150,15 +150,15 @@ def _make_args(colocate_all=False, colocate_actor_ref=False, colocate_critic_rew
     )
 
 
-def _record_dispatch_events(**flags):
+def _record_dispatch_events(with_critic=True, with_reference=True, **flags):
     events = []
     module = _load_experience_maker(events)
 
     maker = module.RemoteExperienceMaker(
         actor_model_group=_RecordingGroup("actor", events),
-        critic_model_group=_RecordingGroup("critic", events),
+        critic_model_group=_RecordingGroup("critic", events) if with_critic else None,
         reward_model_group=_RecordingGroup("reward", events),
-        initial_model_group=_RecordingGroup("reference", events),
+        initial_model_group=_RecordingGroup("reference", events) if with_reference else None,
         kl_controller=SimpleNamespace(value=0.0),
         strategy=SimpleNamespace(args=_make_args(**flags)),
         tokenizer=SimpleNamespace(pad_token_id=0),
@@ -231,3 +231,35 @@ def test_reference_cache_is_released_only_when_it_shares_gpus(colocate_actor_ref
         assert _index(events, "dispatch:reference") < _index(events, "empty_cache:reference")
     else:
         assert "empty_cache:reference" not in events
+
+
+def test_colocate_all_overrides_the_individual_flags():
+    """--colocate_all puts every model on one GPU set, so the individual flags change nothing."""
+    sequential = _record_dispatch_events(colocate_all=True)
+    sequential_with_flags = _record_dispatch_events(
+        colocate_all=True, colocate_actor_ref=True, colocate_critic_reward=True
+    )
+
+    assert sequential == sequential_with_flags
+
+
+@pytest.mark.parametrize("with_critic", [False, True])
+@pytest.mark.parametrize("with_reference", [False, True])
+def test_missing_model_groups_do_not_break_the_dispatch_sequence(with_critic, with_reference):
+    """A run without a critic or a reference model still dispatches the remaining forwards."""
+    events = _record_dispatch_events(
+        with_critic=with_critic,
+        with_reference=with_reference,
+        colocate_actor_ref=True,
+        colocate_critic_reward=True,
+    )
+
+    dispatched = [event for event in events if event.startswith("dispatch:")]
+    expected = ["dispatch:reward", "dispatch:actor"]
+    if with_critic:
+        expected.append("dispatch:critic")
+    if with_reference:
+        expected.append("dispatch:reference")
+
+    assert dispatched == expected
+    assert "barrier:dummy" not in events
